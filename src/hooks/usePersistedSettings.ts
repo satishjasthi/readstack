@@ -6,6 +6,11 @@
  * responsible for wiring up via the crypto module directly. This hook only
  * covers the plain settings fields workstream A needs for the sync engine
  * config (owner/repo/path/branch/readingSpeedWpm).
+ *
+ * `readstack-data` is a PUBLIC repo — the JSON file itself is encrypted
+ * client-side (AES-GCM), so repo visibility isn't the security boundary.
+ * This means reads (pull on load) work with no token at all; only writes
+ * (push on mutation) need a PAT, since GitHub never allows anonymous pushes.
  */
 
 import { useCallback, useState } from "react";

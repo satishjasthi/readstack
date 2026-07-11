@@ -47,8 +47,10 @@ export function PatField({ hasStoredValue, onSave, disabled = false }: PatFieldP
     <div className="settings-field" data-testid="pat-field">
       <label htmlFor="pat-input">GitHub Personal Access Token</label>
       <p className="settings-field-hint">
-        Fine-grained token scoped to <code>readstack-data</code> contents (read + write).
-        Encrypted with your passphrase before being stored in this browser.
+        Fine-grained token scoped to <code>readstack-data</code> contents (write
+        access — reading your stack never needs this, since the repo is public and
+        the file is encrypted). Encrypted with your passphrase before being stored
+        in this browser.
         {hasStoredValue ? " A token is currently configured." : " No token configured yet."}
       </p>
       <div className="settings-field-row">

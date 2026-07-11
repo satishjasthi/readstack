@@ -13,9 +13,19 @@ export interface GitHubFileClientConfig {
   repo: string;
   path: string;
   branch: string;
-  /** Fine-grained PAT scoped to this repo's contents (read+write). Never
-   * logged, never sent anywhere but api.github.com. */
-  token: string;
+  /**
+   * Fine-grained PAT scoped to this repo's contents (read+write).
+   *
+   * Optional: `readstack-data` is a PUBLIC repo (the file itself is
+   * encrypted, so repo visibility isn't the security boundary). Reads
+   * (getFileContents) work fully unauthenticated against a public repo —
+   * no token needed to pull/decrypt on a new device. A token is only
+   * required for writes (updateFileContents), since GitHub never allows
+   * unauthenticated pushes regardless of repo visibility.
+   *
+   * Never logged, never sent anywhere but api.github.com.
+   */
+  token?: string;
 }
 
 export interface GitHubFileContents {
@@ -46,12 +56,15 @@ export class GitHubFileNotFoundError extends GitHubApiError {
   }
 }
 
-function authHeaders(token: string): HeadersInit {
-  return {
-    Authorization: `Bearer ${token}`,
+function authHeaders(token: string | undefined): HeadersInit {
+  const headers: Record<string, string> = {
     Accept: "application/vnd.github+json",
     "X-GitHub-Api-Version": "2022-11-28",
   };
+  if (token) {
+    headers.Authorization = `Bearer ${token}`;
+  }
+  return headers;
 }
 
 function contentsUrl(cfg: Pick<GitHubFileClientConfig, "owner" | "repo" | "path">): string {
@@ -125,6 +138,13 @@ export async function updateFileContents(
   commitMessage: string,
   previousSha: string | undefined,
 ): Promise<UpdateFileContentsResult> {
+  if (!cfg.token) {
+    throw new GitHubApiError(
+      "A GitHub token is required to push updates (reads can be anonymous against a public repo, but GitHub never allows unauthenticated writes).",
+      401,
+    );
+  }
+
   const response = await fetch(contentsUrl(cfg), {
     method: "PUT",
     headers: {

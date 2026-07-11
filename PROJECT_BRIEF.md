@@ -8,25 +8,52 @@ through a timeline, with a side rail showing the timeline position.
 
 ## Repos
 - App code (public): https://github.com/satishjasthi/readstack
-- Data store (private): https://github.com/satishjasthi/readstack-data
+- Data store (PUBLIC as of 2026-07-11, see decision log below):
+  https://github.com/satishjasthi/readstack-data
   - Contains a single encrypted file, e.g. `data.json.enc`
 
 ## Confirmed architecture decisions
-1. App repo is PUBLIC. Data repo is PRIVATE. JSON is encrypted at rest in the data
-   repo regardless (defense in depth).
+1. App repo is PUBLIC. Data repo is also PUBLIC (revised 2026-07-11 — see decision
+   log below). The JSON is encrypted at rest in the data repo either way;
+   encryption, not repo visibility, is the security boundary.
 2. Encryption: client-side WebCrypto, AES-GCM, key derived via PBKDF2 from a
    user-entered passphrase each session. Key lives only in memory / sessionStorage,
    never persisted to disk, never leaves the device.
 3. GitHub write access: user supplies a fine-grained GitHub Personal Access Token
-   (scoped to `readstack-data` repo contents, read+write) via a settings screen.
-   Token stored in browser storage (encrypted with the same session passphrase-derived
-   key, or sessionStorage) — never hardcoded, never committed, never sent anywhere
+   (scoped to `readstack-data` repo contents, write access) via a settings screen —
+   requested lazily, only the first time a write (add article, progress update) is
+   attempted. Reads (pull on load) need NO token at all, since the repo is public.
+   Token stored in browser storage (encrypted with the same session
+   passphrase-derived key) — never hardcoded, never committed, never sent anywhere
    except GitHub's REST API.
-4. Stack: React + Vite + TypeScript, static site, deployable to GitHub Pages from the
-   `readstack` repo.
+4. Stack: React + Vite + TypeScript, static site, deployed to GitHub Pages from the
+   `readstack` repo (hosting is what makes it usable on mobile/iPad via Safari —
+   independent of the data repo's visibility).
 5. Article content/word-count extraction: best-effort client-side fetch (will hit CORS
    on many sites) with manual override — user can paste/edit estimated word count.
    No server-side proxy in v1.
+
+## Decision log: private → public data repo (2026-07-11)
+Originally the data repo was private, requiring a GitHub PAT to even read/probe it
+on every device before the app could load. User pushed back: since the file is
+encrypted, repo privacy was redundant security theater, and it forced a PAT prompt
+before you could even view your own stack on a new device. Resolution:
+- Data repo switched to public. `getFileContents`/reads now work fully
+  unauthenticated — anyone can technically fetch the ciphertext blob (as intended;
+  encryption is the boundary), but cannot decrypt it without the passphrase.
+- Writes still require a PAT — this is a hard GitHub platform constraint (no
+  anonymous pushes exist, on any repo, public or private), not a design choice. The
+  PAT prompt was moved from "required before you can unlock/load anything" to
+  "requested lazily on first write attempt," which meaningfully simplifies the
+  cross-device read flow.
+- Trade-off surfaced to user: since commit message = article name (see below), and
+  commit history on a public repo is world-readable, article *titles* and *when
+  added* are now technically public even though article *content/tags/notes* stay
+  encrypted. User accepted this trade-off explicitly.
+- GitHub Pages hosting (for mobile/iPad access via a real URL) is unrelated to this
+  decision and was kept — it's how the app is reachable on a device at all, separate
+  from how the data syncs.
+
 
 ## Core features
 1. Add article: URL + title (auto-fetch if possible) + tags.

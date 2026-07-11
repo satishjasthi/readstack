@@ -3,23 +3,25 @@
  * UI (UnlockScreen/AppShell/TimeMachineStack), and workstream C's
  * SettingsScreen/useReadingSession together.
  *
- * Flow:
- *  1. Show SettingsScreen (no DataStoreProvider yet) so the user can enter
- *     a GitHub PAT + owner/repo/branch/path + reading speed. SettingsScreen
- *     tolerates being rendered pre-provider (see WORKSTREAM_C_NOTES.md).
- *  2. Once a PAT + owner are present, probe the data repo directly via
- *     `getFileContents` (no key needed — only the `salt`/`iterations` inside
- *     the still-encrypted EncryptedPayload are read) to decide first-run
- *     (404 -> unlockFresh) vs returning user (existing salt -> unlockWithSalt),
- *     per A's syncEngine notes on first-run detection.
- *  3. Render UnlockScreen (B) with the right mode; on submit, derive the
- *     session key via useSessionKey (A).
- *  4. Mount <DataStoreProvider> (A) with the assembled GitHub config + key,
- *     call load(), then render AppShell (B).
+ * Flow (simplified: `readstack-data` is a PUBLIC repo, since the file
+ * itself is encrypted — repo visibility isn't the security boundary):
+ *  1. Once a GitHub owner is set, probe the data repo directly via
+ *     `getFileContents` — no token needed, reads on a public repo are
+ *     anonymous — to decide first-run (404 -> unlockFresh) vs returning
+ *     user (existing salt -> unlockWithSalt).
+ *  2. Render UnlockScreen (B) with the right mode; on submit, derive the
+ *     session key via useSessionKey (A). No PAT involved yet.
+ *  3. Mount <DataStoreProvider> (A) and call load() — still no token
+ *     needed, this is a read. Render AppShell (B) with your stack.
+ *  4. A GitHub PAT is only requested the first time the user performs a
+ *     WRITE (add an article, update progress, etc.) — via PatBootstrap,
+ *     rendered inline only when a write is attempted without one on file.
+ *     GitHub never allows unauthenticated pushes, even to a public repo,
+ *     so this part is unavoidable — but it no longer blocks reading/
+ *     browsing your existing stack on a new device.
  *  5. AppShell's onOpenArticle is wired to useReadingSession().openArticle
  *     (C) rather than TimeMachineStack's bare openArticleInNewTab, so
- *     opening a card also starts real completion tracking. onAddArticle is
- *     wired to dispatch({ type: "ADD_ARTICLE" }) (A).
+ *     opening a card also starts real completion tracking.
  */
 
 import { useCallback, useEffect, useState } from "react";
@@ -50,9 +52,9 @@ function base64ToBytes(base64: string): Uint8Array {
 }
 
 /**
- * Pre-unlock phase: collect GitHub settings + PAT via SettingsScreen, then
- * probe the data repo to decide first-run vs returning-user, then collect
- * the passphrase via UnlockScreen. Resolves once a CryptoKey is derived.
+ * Pre-unlock phase: probe the (public, unauthenticated-readable) data repo
+ * to decide first-run vs returning-user, then collect the passphrase via
+ * UnlockScreen. Resolves once a CryptoKey is derived. No PAT involved.
  */
 function UnlockFlow({
   githubConfig,
@@ -131,7 +133,7 @@ function UnlockFlow({
     return (
       <div className="unlock-screen">
         <p className="unlock-screen__subtitle">
-          Configure a GitHub token and owner in Settings below before unlocking.
+          Enter a GitHub owner/org below (in Settings) to locate your reading stack.
         </p>
       </div>
     );
@@ -166,11 +168,19 @@ function UnlockFlow({
 }
 
 /** Mounted once a CryptoKey + GitHub config are available. Loads the store
- * and renders the real app (AppShell), wiring in useReadingSession so
- * opening a card starts completion tracking. */
-function UnlockedApp() {
+ * (read-only, no PAT needed against the public data repo) and renders the
+ * real app (AppShell). A PAT is only requested lazily, the first time a
+ * write is attempted (see `PatGate`). */
+function UnlockedApp({
+  pat,
+  onRequestPat,
+}: {
+  pat: string | null;
+  onRequestPat: (pat: string) => void;
+}) {
   const { data, isLoading, syncStatus, syncError, load, dispatch } = useDataStore();
   const [isSubmitting, setIsSubmitting] = useState(false);
+  const [pendingPatPrompt, setPendingPatPrompt] = useState(false);
   const readingSession = useReadingSession({
     readingSpeedWpm: data?.settings.readingSpeedWpm ?? 200,
   });
@@ -183,6 +193,13 @@ function UnlockedApp() {
 
   const handleAddArticle = useCallback(
     async (input: NewArticleInput) => {
+      if (!pat) {
+        // First write of the session: we can't push without a token (GitHub
+        // never allows unauthenticated writes, even on a public repo).
+        // Surface the PAT prompt instead of silently failing.
+        setPendingPatPrompt(true);
+        return;
+      }
       setIsSubmitting(true);
       try {
         await dispatch({ type: "ADD_ARTICLE", input });
@@ -190,7 +207,7 @@ function UnlockedApp() {
         setIsSubmitting(false);
       }
     },
-    [dispatch],
+    [dispatch, pat],
   );
 
   if (isLoading || !data) {
@@ -204,14 +221,32 @@ function UnlockedApp() {
   }
 
   return (
-    <AppShell
-      articles={data.articles}
-      onAddArticle={handleAddArticle}
-      isSubmitting={isSubmitting}
-      syncStatus={syncStatus}
-      syncError={syncError}
-      onOpenArticle={readingSession.openArticle}
-    />
+    <>
+      {pendingPatPrompt && !pat && (
+        <div className="settings-field" data-testid="pat-write-gate">
+          <label htmlFor="pat-write-gate-input">GitHub token (needed to save)</label>
+          <p className="settings-field-hint">
+            Reading your stack never needs a token — <code>readstack-data</code> is
+            public and the file is encrypted. Saving a change requires one, since
+            GitHub only allows authenticated pushes.
+          </p>
+          <PatBootstrap
+            onPat={(value) => {
+              onRequestPat(value);
+              setPendingPatPrompt(false);
+            }}
+          />
+        </div>
+      )}
+      <AppShell
+        articles={data.articles}
+        onAddArticle={handleAddArticle}
+        isSubmitting={isSubmitting}
+        syncStatus={syncStatus}
+        syncError={syncError}
+        onOpenArticle={readingSession.openArticle}
+      />
+    </>
   );
 }
 
@@ -222,16 +257,20 @@ function App() {
   const [salt, setSalt] = useState<Uint8Array | null>(null);
   const [iterations, setIterations] = useState<number>(0);
 
-  const githubConfig: GitHubFileClientConfig | null =
-    pat && settings.githubOwner
-      ? {
-          owner: settings.githubOwner,
-          repo: settings.githubRepo,
-          path: settings.dataFilePath,
-          branch: settings.githubBranch,
-          token: pat,
-        }
-      : null;
+  // Reads (probe + load) never need a token — readstack-data is public.
+  const readConfig: GitHubFileClientConfig | null = settings.githubOwner
+    ? {
+        owner: settings.githubOwner,
+        repo: settings.githubRepo,
+        path: settings.dataFilePath,
+        branch: settings.githubBranch,
+      }
+    : null;
+
+  // Writes (dispatch/push) attach the PAT once the user has supplied one.
+  const githubConfig: GitHubFileClientConfig | null = readConfig
+    ? { ...readConfig, token: pat ?? undefined }
+    : null;
 
   const handleUnlocked = useCallback((key: CryptoKey, s: Uint8Array, iters: number) => {
     setUnlockedKey(key);
@@ -248,14 +287,14 @@ function App() {
         iterations={iterations}
         defaultSettings={settings}
       >
-        <UnlockedApp />
+        <UnlockedApp pat={pat} onRequestPat={setPat} />
       </DataStoreProvider>
     );
   }
 
   return (
     <div className="app-shell">
-      <UnlockFlow githubConfig={githubConfig} onUnlocked={handleUnlocked} />
+      <UnlockFlow githubConfig={readConfig} onUnlocked={handleUnlocked} />
       <GitHubRepoBootstrap
         githubOwner={settings.githubOwner}
         githubRepo={settings.githubRepo}
@@ -264,12 +303,6 @@ function App() {
         onChange={updateSettings}
       />
       <SettingsScreen isReturningUser={false} />
-      {/* PAT capture: SettingsScreen's PatField persists the encrypted PAT
-          via usePersistedPat, but that requires a session key which we
-          don't have until after unlock — so this pre-unlock phase reads the
-          PAT the user types via a lightweight local callback below instead
-          of round-tripping through the encrypted store. */}
-      <PatBootstrap onPat={setPat} />
     </div>
   );
 }
@@ -303,7 +336,8 @@ function GitHubRepoBootstrap({
     <div className="settings-field" data-testid="github-repo-bootstrap">
       <label htmlFor="github-owner-input">GitHub owner/org</label>
       <p className="settings-field-hint">
-        The account that owns the private <code>readstack-data</code> repo.
+        The account that owns the public <code>readstack-data</code> repo. No token
+        needed just to read your stack.
       </p>
       <input
         id="github-owner-input"
@@ -342,39 +376,28 @@ function GitHubRepoBootstrap({
 }
 
 /**
- * Pre-unlock PAT entry. `usePersistedPat`/`PatField` (C's components) are
- * designed to encrypt the PAT with the session key, which doesn't exist
- * yet at this point in the flow (we need the PAT to reach GitHub before we
- * can even determine first-run vs returning, which determines how we
- * derive the key). This lightweight field collects the PAT in memory only
- * for this session's bootstrap; SettingsScreen above remains responsible
- * for persisting it (encrypted) once a session key exists, so subsequent
- * app loads within the same tab don't need to re-enter it here.
+ * PAT entry, requested lazily on first write (see `UnlockedApp`) rather
+ * than up front. `usePersistedPat`/`PatField` (C's components, in
+ * SettingsScreen) persist it encrypted with the session key for the rest
+ * of the tab session once provided; this lightweight field just collects
+ * the value in memory for this callback.
  */
 function PatBootstrap({ onPat }: { onPat: (pat: string) => void }) {
   const [value, setValue] = useState("");
 
   return (
-    <div className="settings-field" data-testid="pat-bootstrap">
-      <label htmlFor="pat-bootstrap-input">GitHub PAT (to locate readstack-data)</label>
-      <p className="settings-field-hint">
-        Needed once per tab session to check whether your encrypted data file exists
-        yet. Also set this in Settings below to have it encrypted and remembered for
-        this browser session.
-      </p>
-      <div className="settings-field-row">
-        <input
-          id="pat-bootstrap-input"
-          type="password"
-          value={value}
-          onChange={(e) => setValue(e.target.value)}
-          placeholder="github_pat_..."
-          autoComplete="off"
-        />
-        <button type="button" onClick={() => value.trim() && onPat(value.trim())}>
-          Use token
-        </button>
-      </div>
+    <div className="settings-field-row">
+      <input
+        id="pat-write-gate-input"
+        type="password"
+        value={value}
+        onChange={(e) => setValue(e.target.value)}
+        placeholder="github_pat_..."
+        autoComplete="off"
+      />
+      <button type="button" onClick={() => value.trim() && onPat(value.trim())}>
+        Use token
+      </button>
     </div>
   );
 }
